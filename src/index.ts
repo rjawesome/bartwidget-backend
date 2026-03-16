@@ -208,6 +208,8 @@ async function fetchRealtimeData() {
                                 }
                             }
 
+                            currentDestination = currentDestination.replace('San Francisco International Airport', 'SFO')
+
                             if (currentDestination && currentDestination.includes('/')) {
                                 const parts = currentDestination.split('/');
                                 currentDestination = parts[parts.length - 1].trim();
@@ -336,6 +338,7 @@ app.post('/register', (req, res) => {
     const departures = stationDepartures[stationName] || [];
     res.status(200).json({
         message: 'Station name registered successfully',
+        timestamp: new Date().toISOString(),
         departures: departures
     });
 });
