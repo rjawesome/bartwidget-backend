@@ -1,0 +1,11 @@
+- dark theme the search menu
+- have the button for search take up the whole bar
+- move the refresh button to the top
+- have widget show less trains if smaller
+- have the refresh button refresh & poll & refresh (if newer timestamp)
+- Caltrain
+- renaming inbound/outbound
+- potentially using the alarm thing combined
+- TTL on notifications
+- multi widget support
+- switch to FCM topics

@@ -5,6 +5,11 @@ import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
 import admin from 'firebase-admin';
 import unzipper from 'unzipper';
 import { parse } from 'csv-parse';
+import { createClient } from '@libsql/client';
+import { Message } from 'firebase-admin/messaging';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 // --- Firebase Admin Setup ---
 // Make sure you have the serviceAccountKey.json file in your backend directory
@@ -14,13 +19,18 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
+// --- Turso DB Setup ---
+const turso = (process.env.REALTIME_DB && process.env.REALTIME_TOKEN)
+    ? createClient({
+        url: process.env.REALTIME_DB,
+        authToken: process.env.REALTIME_TOKEN,
+    }) : null;
+
 const app = express();
-const port = 3000;
+const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(bodyParser.json());
 
-const dataFile = './data.json';
-let fcmData: Record<string, string> = {};
 
 interface Station {
     id: string;
@@ -58,12 +68,6 @@ let routes: Record<string, Route> = {};
 let trips: Record<string, Trip> = {};
 let stationDepartures: Record<string, Record<string, Departure[]>> = {};
 
-// Load fcm data from file on startup
-if (fs.existsSync(dataFile)) {
-    const rawData = fs.readFileSync(dataFile, 'utf-8');
-    fcmData = JSON.parse(rawData);
-}
-
 // --- GTFS Static Data Handling ---
 const gtfsStaticUrl = 'https://www.bart.gov/dev/schedules/google_transit.zip';
 const stopsFile = 'stops.txt';
@@ -81,6 +85,10 @@ async function updateStaticData() {
         const buffer = await response.arrayBuffer();
         const directory = await unzipper.Open.buffer(Buffer.from(buffer));
         
+        let parsedStations: Record<string, Station> | null = null;
+        let parsedRoutes: Record<string, Route> | null = null;
+        let parsedTrips: Record<string, Trip> | null = null;
+
         const stopsFileEntry = directory.files.find(f => f.path === stopsFile);
         if (stopsFileEntry) {
             const content = await stopsFileEntry.buffer();
@@ -101,8 +109,7 @@ async function updateStaticData() {
                     };
                 }
             }
-            stations = newStations;
-            console.log(`Successfully updated ${Object.keys(stations).length} stations.`);
+            parsedStations = newStations;
         } else {
             console.error(`${stopsFile} not found in the zip archive.`);
         }
@@ -120,8 +127,9 @@ async function updateStaticData() {
                     color: row.route_color
                 };
             }
-            routes = newRoutes;
-            console.log(`Successfully updated ${Object.keys(routes).length} routes.`);
+            parsedRoutes = newRoutes;
+        } else {
+            console.error(`${routesFile} not found in the zip archive.`);
         }
 
         const tripsFileEntry = directory.files.find(f => f.path === tripsFile);
@@ -137,8 +145,31 @@ async function updateStaticData() {
                     directionId: row.direction_id
                 };
             }
-            trips = newTrips;
-            console.log(`Successfully updated ${Object.keys(trips).length} trips.`);
+            parsedTrips = newTrips;
+        } else {
+            console.error(`${tripsFile} not found in the zip archive.`);
+        }
+
+        // Atomically replace static data tables
+        if (parsedStations && parsedRoutes && parsedTrips) {
+            stations = parsedStations;
+            routes = parsedRoutes;
+            trips = parsedTrips;
+            console.log(`Successfully updated static data: ${Object.keys(stations).length} stations, ${Object.keys(routes).length} routes, ${Object.keys(trips).length} trips.`);
+            
+            if (turso) {
+                try {
+                    // Deduplicate station names
+                    const stationNames = Array.from(new Set(Object.values(stations).map(s => s.name)));
+                    await turso.execute({
+                        sql: `INSERT INTO stations (system, data) VALUES (?, ?) ON CONFLICT (system) DO UPDATE SET data = excluded.data`,
+                        args: ['BART', JSON.stringify(stationNames)]
+                    });
+                    console.log('Successfully wrote station list to Turso DB.');
+                } catch (dbError) {
+                    console.error('Error writing stations to Turso DB:', dbError);
+                }
+            }
         }
     } catch (error) {
         console.error('Error updating static data:', error);
@@ -250,6 +281,29 @@ async function fetchRealtimeData() {
         checkForChangesAndNotify(newDepartures);
         stationDepartures = newDepartures;
 
+        // Write realtime departures to Turso DB
+        if (turso) {
+            try {
+                const timestamp = new Date().toISOString();
+                const queries = Object.entries(newDepartures).map(([stationName, lines]) => {
+                    // Replicate the exact data format sent in the push notification
+                    const pushData = {
+                        timestamp,
+                        station: stationName,
+                        departures: JSON.stringify(lines)
+                    };
+                    return {
+                        sql: `INSERT INTO realtime_data (station, data) VALUES (?, ?) ON CONFLICT (station) DO UPDATE SET data = excluded.data`,
+                        args: [stationName, JSON.stringify(pushData)]
+                    };
+                });
+                if (queries.length > 0) {
+                    await turso.batch(queries, "write");
+                }
+            } catch (dbError) {
+                console.error('Error writing realtime data to Turso DB:', dbError);
+            }
+        }
     } catch (error) {
         console.error('Error fetching realtime data:', error);
     }
@@ -258,6 +312,7 @@ async function fetchRealtimeData() {
 
 function checkForChangesAndNotify(newDepartures: Record<string, Record<string, Departure[]>>) {
     const timestamp = new Date().toISOString();
+    const messagePromises: Promise<string>[] = [];
 
     for (const stationName in newDepartures) {
         const oldStationLines = stationDepartures[stationName] || {};
@@ -283,65 +338,37 @@ function checkForChangesAndNotify(newDepartures: Record<string, Record<string, D
             }
 
             if (hasSignificantChange) {
-                const tokens = Object.keys(fcmData).filter(token => fcmData[token] === stationName);
+                const topic = `BART_${stationName.replace(/[^a-zA-Z0-9-_.~%]/g, '_')}`;
+                console.log(topic)
+                const message: Message = {
+                    data: {
+                        timestamp,
+                        station: stationName,
+                        departures: JSON.stringify(newStationLines)
+                    },
+                    android: {
+                        ttl: 20 * 60 * 1000 // 20 minutes in milliseconds
+                    },
+                    apns: {
+                        headers: {
+                            'apns-expiration': Math.floor(Date.now() / 1000 + 20 * 60).toString()
+                        }
+                    },
+                    topic: topic,
+                };
 
-                if (tokens.length > 0) {
-                    console.log("sending message to ", tokens);
-                    const message = {
-                        // notification: {
-                        //     title: `BART Update for ${stationName}`,
-                        //     body: `Departure times for line ${lineKey} have changed.`
-                        // },
-                        data: {
-                            timestamp,
-                            station: stationName,
-                            departures: JSON.stringify(newStationLines)
-                        },
-                        tokens: tokens,
-                    };
-
-                    admin.messaging().sendEachForMulticast(message)
-                        .then((response) => {
-                            console.log(response.successCount + ' messages were sent successfully');
-                            console.log(JSON.stringify(response))
-                        })
-                        .catch((error) => {
-                            console.log('Error sending message:', error);
-                        });
-                }
+                messagePromises.push(admin.messaging().send(message));
                 break; 
             }
         }
     }
+
+    if (messagePromises.length > 0) {
+        Promise.all(messagePromises)
+            .then(() => console.log(`Successfully sent ${messagePromises.length} notifications.`))
+            .catch(error => console.error('Error sending notifications:', error));
+    }
 }
-
-
-app.post('/register', (req, res) => {
-    console.log('recieved register request')
-    const { fcmId, stationName } = req.body;
-
-    if (!fcmId || !stationName) {
-        return res.status(400).send('fcmId and stationName are required');
-    }
-
-    // Verify stationName exists
-    const stationExists = Object.values(stations).some(s => s.name === stationName);
-    if (!stationExists) {
-        return res.status(400).send(`Invalid stationName: ${stationName}`);
-    }
-
-    fcmData[fcmId] = stationName;
-
-    // Save data to file
-    fs.writeFileSync(dataFile, JSON.stringify(fcmData, null, 2));
-
-    const departures = stationDepartures[stationName] || [];
-    res.status(200).json({
-        message: 'Station name registered successfully',
-        timestamp: new Date().toISOString(),
-        departures: departures
-    });
-});
 
 
 app.post('/poll', (req, res) => {
@@ -364,16 +391,10 @@ app.post('/poll', (req, res) => {
     });
 });
 
-app.get('/stations', (req, res) => {
-    res.status(200).json({
-        stations: Object.keys(stationDepartures)
-    });
-});
-
-
 app.listen(port, '0.0.0.0', async () => {
     console.log(`Server is running on http://0.0.0.0:${port}`);
     await updateStaticData(); // Initial fetch of station data
+    setInterval(updateStaticData, 24 * 60 * 60 * 1000); // Fetch static data every 24 hours
     await fetchRealtimeData();
     setInterval(fetchRealtimeData, 30000); // Fetch realtime data every 30 seconds
 });
