@@ -242,11 +242,12 @@ async function fetchRealtimeData() {
                             currentDestination = currentDestination.replace('San Francisco International Airport', 'SFO')
 
                             if (currentDestination && currentDestination.includes(' / ')) {
-                                const parts = currentDestination.split('/');
+                                const parts = currentDestination.split(' / ');
                                 currentDestination = parts[parts.length - 1].trim();
                                 currentDestination = currentDestination.split('/')[0];
                             }
 
+                            currentDestination = currentDestination.split('(')[0].trimEnd()
 
                             if (!newDepartures[stationName]) {
                                 newDepartures[stationName] = {};
