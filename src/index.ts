@@ -103,7 +103,7 @@ async function updateStaticData() {
                 if (row.location_type === '1' || row.location_type === '0') {
                     newStations[row.stop_id] = {
                         id: row.stop_id,
-                        name: row.stop_name,
+                        name: row.stop_name.split('(')[0].trimEnd(), // mainly for Millbrae
                         lat: row.stop_lat,
                         lon: row.stop_lon
                     };
@@ -241,9 +241,10 @@ async function fetchRealtimeData() {
 
                             currentDestination = currentDestination.replace('San Francisco International Airport', 'SFO')
 
-                            if (currentDestination && currentDestination.includes('/')) {
+                            if (currentDestination && currentDestination.includes(' / ')) {
                                 const parts = currentDestination.split('/');
                                 currentDestination = parts[parts.length - 1].trim();
+                                currentDestination = currentDestination.split('/')[0];
                             }
 
 
@@ -339,7 +340,6 @@ function checkForChangesAndNotify(newDepartures: Record<string, Record<string, D
 
             if (hasSignificantChange) {
                 const topic = `BART_${stationName.replace(/[^a-zA-Z0-9-_.~%]/g, '_')}`;
-                console.log(topic)
                 const message: Message = {
                     data: {
                         timestamp,
