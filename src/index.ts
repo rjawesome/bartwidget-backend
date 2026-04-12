@@ -103,7 +103,7 @@ async function updateStaticData() {
                 if (row.location_type === '1' || row.location_type === '0') {
                     newStations[row.stop_id] = {
                         id: row.stop_id,
-                        name: row.stop_name.split('(')[0].trimEnd(), // mainly for Millbrae
+                        name: row.stop_name.replace('San Francisco International', 'SFO').split('(')[0].trimEnd(), // mainly for Millbrae
                         lat: row.stop_lat,
                         lon: row.stop_lon
                     };
