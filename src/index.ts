@@ -165,6 +165,10 @@ async function updateStaticData() {
                         sql: `INSERT INTO stations (system, data) VALUES (?, ?) ON CONFLICT (system) DO UPDATE SET data = excluded.data`,
                         args: ['BART', JSON.stringify(stationNames)]
                     });
+                    await turso.execute({
+                        sql: `INSERT INTO stations (system, data) VALUES (?, ?) ON CONFLICT (system) DO UPDATE SET data = excluded.data`,
+                        args: ['BART2', JSON.stringify(stations)]
+                    });
                     console.log('Successfully wrote station list to Turso DB.');
                 } catch (dbError) {
                     console.error('Error writing stations to Turso DB:', dbError);
